@@ -1,0 +1,48 @@
+name: CI
+
+"on":
+  merge_group: {}
+  pull_request: {}
+  push:
+    branches-ignore:
+      # These should always correspond to pull requests, so ignore them for
+      # the push trigger and let them be triggered by the pull_request
+      # trigger, avoiding running the workflow twice. This is a minor
+      # optimization so there's no need to ensure this is comprehensive.
+      - "dependabot/**"
+      - "gh-readonly-queue/**"
+      - "renovate/**"
+      - "t/**"
+      - "tickets/**"
+      - "u/**"
+  release:
+    types: [published]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run tests
+        run: ./test_cleanup
+
+  build:
+    needs: [test]
+    secrets: inherit
+    uses: lsst-sqre/multiplatform-build-and-push/.github/workflows/build.yaml@v4
+    with:
+      images: ghcr.io/${{ github.repository }}
+      additional-tags: "latest"
+
+    # Only do Docker builds of tagged releases and pull requests from ticket
+    # branches. This will still trigger on pull requests from untrusted
+    # repositories whose branch names match our tickets/* branch convention,
+    # but in this case the build will fail with an error since the secret
+    # won't be set.
+    if: >
+      (github.event_name == 'release' && github.event.action == 'published')
+      || (github.event_name != 'merge_group'
+          && (startsWith(github.head_ref, 'tickets/')
+              || startsWith(github.head_ref, 't/')))
