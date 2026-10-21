@@ -34,14 +34,14 @@ fi
 # You need 'awk', 'command', 'cut', and 'rev' to even test the logic.
 #
 for cmd in awk cut; do
-    vcmd=$(command -v ${cmd})  # 'command' is POSIX; 'which' is not.
+    vcmd=$(command -v ${cmd} || true)  # 'command' is POSIX; 'which' is not.
     if [ -z "${vcmd}" ]; then
         printf "No \"%s\" in PATH=\"%s\"\n" ${cmd} ${PATH} 1>&2
         exit 1
     fi
 done
 # But plenty of modern systems lack quota
-quotacmd=$(command -v quota)
+quotacmd=$(command -v quota || true)
 if [ -z "${quotacmd}" ]; then 
     printf "No \"quota\" in PATH=\"${PATH}\"\n" ${PATH} 1>&2
     if [ "${_TESTING}" -ne 1 ]; then
@@ -70,8 +70,10 @@ get_quota_pct () {
     #  Next line names the filesystem.
     #  The one after that has all the values.
     # Hence the very last line contains the values.
+    set +e  # Disable exit on failure here.
     quota=$(${QUOTA} -f ${CLEANUP_MOUNTPOINT} | tail -1)
     rc=$?
+    set -e
     if [ "${rc}" -ne 0 ]; then
         # Quota didn't work.  Probably that's because no quota is set on
         # the filesystem.
@@ -112,7 +114,8 @@ _maybe_test_arithmetic () {
     fi
 }
 
-times="14d 10d 7d 5d 3d 2d 1d 720m 360m 180m 60m 30m 15m 10m"
+times="14d 10d 7d 5d 3d 2d 1d 720m 360m 180m 60m 30m 15m 10m 5m 3m 2m 1m"
+lasttime="Initial"
 for time in ${times}; do
     unit=$(printf "%s\n" ${time} | rev | cut -c -1)
     num=$(printf "%s\n" ${time} | rev | cut -c 2- | rev)
@@ -143,40 +146,44 @@ for time in ${times}; do
             # Success!
             exit 0
         fi
-        printf "File usage at %s%% > %s%%\n" ${PCT_FIL_USED} \
-               ${CLEANUP_THRESHOLD}
+        printf "%s file usage at %s%% > %s%%\n" ${lasttime} ${PCT_FIL_USED} \
+               ${CLEANUP_THRESHOLD} 2>&1
     else
-        printf "Block usage at %s%% > %s%%\n" ${PCT_BLK_USED} \
-               ${CLEANUP_THRESHOLD}
+        printf "%s block usage at %s%% > %s%%\n" ${lasttime} ${PCT_BLK_USED} \
+               ${CLEANUP_THRESHOLD} 2>&1
     fi
         
     # These are strings so we can print them if we're testing,
     #  and execute them if we are not.
-    # Busybox 'find' supports -print0
+    # Busybox 'find' and 'xargs' support -print0
+    # 'grep' is trickier, but GNU 'grep' and MacOS 'grep' support both -z
+    # and --null (-Z means different things).  Busybox doesn't, so we install
+    # GNU 'grep' in the container.
     genfindcmd="find ${CLEANUP_MOUNTPOINT} -print0"
     findfilecmd="${genfindcmd} -type f ${findtime}"
     finddircmd="${genfindcmd} -type d -empty"
     genrmcmd="xargs -0 -r"
     rmfilecmd="${genrmcmd} rm -f"
     rmdircmd="${genrmcmd} rmdir"
+    topregex=$(printf "^%s$" "${CLEANUP_MOUNTPOINT}")
+    avoidtop="grep -v -z --null ${topregex}"
+    
     if [ "${_TESTING}" -eq 1 ]; then  # Don't really run the find/rm
-        printf "%s" "${findfilecmd}" 1>&2
-        printf " | %s\n" "${rmfilecmd}" 1>&2
-        printf "%s" "${finddircmd}" 1>&2
-        printf " | %s\n" "${rmdircmd}" 1>&2
+        printf "%s | %s | %s\n" "${findfilecmd}" "${avoidtop}" "${rmfilecmd}" \
+               1>&2
     else  # Do run them.
-        # Busybox 'xargs' supports -0
-        topregex=$(printf "^%s$" "${CLEANUP_MOUNTPOINT}")
-        ${findfilecmd} | grep -v ${topregex} | ${rmfilecmd}
-        ${finddircmd} | grep -v "${topregex}" | ${rmdircmd}
+        ${findfilecmd} | ${avoidtop} | ${rmfilecmd}
+        ${finddircmd} | ${avoidtop} | ${rmdircmd}
     fi
+    lasttime="${time}"
 done
 
 # We ran out of stuff to remove.  Fail unless we are testing.
 printf "Failed to clean %s" "${CLEANUP_MOUNTPOINT}" 1>&2
-printf " below %s%%\n" "${CLEANUP_THRESHOLD}" 1>&2
+printf " below %s%%" "${CLEANUP_THRESHOLD}" 1>&2
+printf " after files older than %s removed.\n" "${lasttime}" 1>&2
 printf "Final block usage: %s%%;" "${PCT_BLK_USED}" 1>&2
-printf " final file usage: %s%%\n" "${PCT_FIL_USED}" 1>&2
+printf " final file usage: %s%%.\n" "${PCT_FIL_USED}" 1>&2
 if [ "${_TESTING}" -eq 0 ]; then
    exit 1
 fi

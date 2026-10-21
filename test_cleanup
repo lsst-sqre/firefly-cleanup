@@ -6,7 +6,7 @@ _find_in_output () {
     rc=$?
     if [ "${rc}" -ne 0 ]; then
         printf "Failed to find \"%s\"" "${needle}" 1>&2
-        printf " in output %s\n" "${output}" 1>&2
+        printf " in output \"%s\"\n" "${output}" 1>&2
         exit 1
     fi
 }
@@ -27,10 +27,12 @@ export _TESTING CLEANUP_MOUNTPOINT CLEANUP_THRESHOLD
 
 test_output_text () {
     output=$(./cleanup 2>&1)
-    for needle in "find /tmp -print0 -type f -mtime +7 | xargs -0 rm -f" \
-                      "find /tmp -print0 -type f -mmin +30 | xargs -0 rm -f" \
-                      "Block usage at 95% > 80%" \
-                      "File usage at 95% > 80%" \
+    for needle in "find /tmp -print0 -type f -mtime +7" \
+                      "find /tmp -print0 -type f -mmin +30 " \
+                      "grep -v -z --null ^/tmp" \
+                      "xargs -0 -r rm -f" \
+                      "14d block usage at 95% > 80%" \
+                      "30m file usage at 95% > 80%" \
                       "Failed to clean /tmp below 80%" \
                       "Final block usage: 30%; final file usage: 95%" ; do
         _find_in_output

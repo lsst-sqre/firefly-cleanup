@@ -1,6 +1,6 @@
 FROM alpine:latest
 
-RUN apk add quota-tools
+RUN apk add quota-tools grep
 COPY cleanup /cleanup
 RUN chmod 0755 /cleanup
 # Uncomment these if you want to do in-container testing.
