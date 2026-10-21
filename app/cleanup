@@ -1,0 +1,172 @@
+#!/bin/sh
+# This script is used to clean up quotaed filesystems by deleting the oldest
+#  file first and iterating until the usage is less than the specified
+#  threshold percentage.  It must run as a user with privilege to remove
+#  files and directories from that filesystem, and it uses the quota of the
+#  user it is running as.
+
+# Its primary intended use case is to manage the Firefly shared workarea,
+#  which keeps overrunning its quota on data-int.lsst.cloud.
+
+# Variable convention: variables local to functions (or mainstream script)
+#  are lowercase.  Anything used inside a function that comes from elsewhere
+#  is UPPERCASE.  The choice to stay (almost) POSIX and avoid bash-isms is
+#  intentional.
+
+# $CLEANUP_THRESHOLD and $CLEANUP_MOUNTPOINT must be set before execution.
+#
+# $CLEANUP_THRESHOLD specifies the integer percentage at or above which this
+#  script will attempt to remove files.  It must be between 1 and 99
+#  inclusive.  The percentage applies to both block and file quotas, but
+#  the only place I've ever seen files run out before blocks is in mail
+#  directories.
+# $CLEANUP_MOUNTPOINT specifies where the filesystem to be cleaned is
+#  mounted.
+
+# Set $_TESTING to nonempty to exercise the loop logic without removing
+#  anything.  Set $DEBUG to trace execution.
+
+# This script exits with return code 0 on success, 1 for incorrect setup
+#  (missing required variables or missing required commands), and 2 for
+#  failure to clean the requested directory.
+
+# This is the one place we are not POSIX-compliant: pipefail is not POSIX.
+# In any event we want to exit on error.
+set -eo pipefail || set -e
+
+# Do this before turning on '-u'; if these are not set, that's OK; we
+#  conditionally set '-x' from $DEBUG or its absence and set _TESTING to
+#  a definite value.
+if [ -n "${DEBUG}" ]; then
+    # Enable verbose output.
+    set -x
+fi
+if [ -n "${_TESTING}" ]; then
+    _TESTING=1
+else
+    _TESTING=0
+fi
+
+if [ "${CLEANUP_THRESHOLD}" -gt 0 ] && [ "${CLEANUP_THRESHOLD}" -lt 100 ]; then
+    # Done in reverse to also fail correctly with a useful message if
+    # $CLEANUP_THRESHOLD isn't numeric.
+    :  # No-op
+else
+    printf "Threshold %s not between 1%% and 99%%!\n" ${CLEANUP_THRESHOLD} 1>&2
+    exit 1
+fi
+
+# Get our functions
+here=$(dirname $0)  # readlink isn't posix, and it's not worth being fancy
+. ${here}/cleanup-fns.sh
+
+# All of 'awk', 'command', 'cut', 'find', 'grep', and 'xargs' are POSIX
+# Mandatory, so they ought to be on any general-purpose Unix-like system.
+#
+# I don't think I've ever seen a Unix-like system that didn't have 'rev'
+#  (although I didn't check backwards beyond v7), even though it isn't
+#  POSIX.
+#  
+# If you are making a container from scratch you will need all of the
+#  above, plus 'quota' and whatever is necessary to mount and work with
+#  NFS filesystems in the first place.
+#
+# You do not need 'quota' to test the logic; it is mocked out for the
+#  test functions.
+#
+for cmd in awk cut; do
+    vcmd=$(command -v ${cmd} || true)  # 'command' is POSIX; 'which' is not.
+    if [ -z "${vcmd}" ]; then
+        printf "No \"%s\" in PATH=\"%s\"\n" ${cmd} ${PATH} 1>&2
+        exit 1
+    fi
+done
+# When testing, we never run the actual pipeline, nor do we use quota.
+if [ "${_TESTING}" -eq 0 ]; then
+    for cmd in find grep quota xargs; do
+        vcmd=$(command -v ${cmd} || true)
+        if [ -z "${vcmd}" ]; then
+            printf "No \"%s\" in PATH=\"%s\"\n" ${cmd} ${PATH} 1>&2
+            exit 1
+        fi
+        if [ "${cmd}" = "quota" ]; then
+            QUOTA="${vcmd}"
+        fi
+    done
+else
+    QUOTA=""  # Mocked out during testing.
+fi
+
+# Below here, warn and exit if we find an unbound variable.
+set -u
+
+times="14d 10d 7d 3d 1d 720m 180m 60m 30m 15m 10m 5m 3m 2m 1m"
+lasttime="Initial"
+if [ "${_TESTING}" -eq 1 ]; then
+    test_arithmetic  # Does nothing if not testing.
+fi
+for time in ${times}; do
+    UNIT=$(printf "%s\n" ${time} | rev | cut -c -1)
+    num=$(printf "%s\n" ${time} | rev | cut -c 2- | rev)
+    if [ "${UNIT}" = "m" ]; then
+        findtime="-mmin +${num}"
+    else
+        findtime="-mtime +${num}"
+    fi
+    if [ "${_TESTING}" -eq 1 ]; then
+        test_failure
+    else
+        get_quota_pct  # Won't really check usage if testing
+    fi
+    if [ "${PCT_BLK_USED}" -lt "${CLEANUP_THRESHOLD}" ]; then
+        if [ "${PCT_FIL_USED}" -lt "${CLEANUP_THRESHOLD}" ]; then
+            # Success!
+            exit 0
+        fi
+        printf "%s file usage at %s%% > %s%%\n" ${lasttime} ${PCT_FIL_USED} \
+               ${CLEANUP_THRESHOLD} 2>&1
+    else
+        printf "%s block usage at %s%% > %s%%\n" ${lasttime} ${PCT_BLK_USED} \
+               ${CLEANUP_THRESHOLD} 2>&1
+    fi
+        
+    # These are strings so we can print them if we're testing,
+    #  and execute them if we are not.
+    # GNU 'grep' and MacOS 'grep' support both -z and --null (-Z means
+    #  different things).
+    genfindcmd="find ${CLEANUP_MOUNTPOINT} -print0"
+    findfilecmd="${genfindcmd} -type f ${findtime}"
+    finddircmd="${genfindcmd} -type d -empty"
+    genrmcmd="xargs -0 -r"
+    rmfilecmd="${genrmcmd} rm -f"
+    rmdircmd="${genrmcmd} rmdir"
+    # We need to remove the directory itself from any list--it may be reported
+    #  as an empty directory, if it is in fact empty, and we do not want to
+    #  remove it.  The find in Alpine also reports the directory in the
+    #  find -type f, which seems really weird, and we're not using Alpine;
+    #  nevertheless, an extra grep doesn't hurt.
+    topregex=$(printf "^%s$" "${CLEANUP_MOUNTPOINT}")
+    avoidtop="grep -v -z --null ${topregex}"  # Not finding it is OK
+    if [ "${_TESTING}" -eq 1 ]; then  # Don't really run the find/rm
+        printf "%s | ( %s || true ) | %s\n" "${findfilecmd}" \
+               "${avoidtop}" "${rmfilecmd}" 1>&2
+        printf "%s | ( %s || true ) | %s\n" "${finddircmd}" \
+               "${avoidtop}" "${rmdircmd}" 1>&2
+    else  # Do run them.
+        ${findfilecmd} | ( ${avoidtop} || true ) | ${rmfilecmd}
+        ${finddircmd} | ( ${avoidtop} || true ) | ${rmdircmd}
+    fi
+    lasttime="${time}"
+done
+
+# We ran out of stuff to remove.
+# Report failure.
+printf "Failed to clean %s" "${CLEANUP_MOUNTPOINT}" 1>&2
+printf " below %s%%" "${CLEANUP_THRESHOLD}" 1>&2
+printf " after files older than %s removed.\n" "${lasttime}" 1>&2
+printf "Final block usage: %s%%;" "${PCT_BLK_USED}" 1>&2
+printf " final file usage: %s%%.\n" "${PCT_FIL_USED}" 1>&2
+# Fail unless testing.
+if [ "${_TESTING}" -eq 0 ]; then
+   exit 2
+fi

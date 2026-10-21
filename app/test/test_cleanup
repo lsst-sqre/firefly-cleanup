@@ -1,19 +1,23 @@
 #!/bin/sh
 
+# Testing 'cleanup' behavior.
+
+# This script assumes it's one directory below the cleanup script.
+
 _find_in_output () {
-    # ${output} and ${needle} are set externally
-    printf "%s\n" "${output}" | grep -q "${needle}"
+    # ${OUTPUT} and ${NEEDLE} are set externally
+    printf "%s\n" "${OUTPUT}" | grep -q "${NEEDLE}"
     rc=$?
     if [ "${rc}" -ne 0 ]; then
-        printf "Failed to find \"%s\"" "${needle}" 1>&2
-        printf " in output \"%s\"\n" "${output}" 1>&2
+        printf "Failed to find \"%s\"" "${NEEDLE}" 1>&2
+        printf " in output \"%s\"\n" "${OUTPUT}" 1>&2
         exit 1
     fi
 }
 
 _expect_failure() {
-    # ${rc} is set externally (no 'shift' in ash/POSIX)
-    if [ "${rc}" -eq 0 ]; then
+    # ${RC} is set externally (no 'shift' in ash/POSIX)
+    if [ "${RC}" -eq 0 ]; then
         printf "Expected error return code; got 0\n"
         exit 1
     fi
@@ -22,17 +26,19 @@ _expect_failure() {
 _TESTING=1
 CLEANUP_MOUNTPOINT=/tmp
 CLEANUP_THRESHOLD=80
+here=$(dirname $0)  # Lazy substitute for readlink
+CLEANUP="${here}/../cleanup"
 
 export _TESTING CLEANUP_MOUNTPOINT CLEANUP_THRESHOLD
 
 test_output_text () {
-    output=$(./cleanup 2>&1)
-    for needle in "find /tmp -print0 -type f -mtime +7" \
-                      "find /tmp -print0 -type f -mmin +30 " \
+    OUTPUT=$(${CLEANUP} 2>&1)
+    for NEEDLE in "find /tmp -print0 -type f -mtime +7" \
+                      "find /tmp -print0 -type f -mmin +30" \
                       "grep -v -z --null ^/tmp" \
                       "xargs -0 -r rm -f" \
-                      "14d block usage at 95% > 80%" \
-                      "30m file usage at 95% > 80%" \
+                      "7d block usage at 95% > 80%" \
+                      "15m file usage at 95% > 80%" \
                       "Failed to clean /tmp below 80%" \
                       "Final block usage: 30%; final file usage: 95%" ; do
         _find_in_output
@@ -42,24 +48,24 @@ test_output_text () {
 test_threshold () {
     CLEANUP_THRESHOLD="bob"
     export CLEANUP_THRESHOLD
-    output=$(./cleanup 2>&1)
-    rc=$?
+    output=$(${CLEANUP} 2>&1)
+    RC=$?
     _expect_failure
     needle="Threshold ${CLEANUP_THRESHOLD} not between 1% and 99%!"
     _find_in_output
     
     CLEANUP_THRESHOLD="-3"
     export CLEANUP_THRESHOLD
-    output=$(./cleanup 2>&1)
-    rc=$?
+    output=$(${CLEANUP} 2>&1)
+    RC=$?
     _expect_failure
     needle="Threshold ${CLEANUP_THRESHOLD} not between 1% and 99%!"
     _find_in_output
 
     CLEANUP_THRESHOLD="110"
     export CLEANUP_THRESHOLD
-    output=$(./cleanup 2>&1)
-    rc=$?
+    output=$(${CLEANUP} 2>&1)
+    RC=$?
     _expect_failure
     needle="Threshold ${CLEANUP_THRESHOLD} not between 1% and 99%!"
     _find_in_output
@@ -70,9 +76,9 @@ test_threshold () {
 
 test_mountpoint () {
     unset CLEANUP_MOUNTPOINT
-    output=$(./cleanup 2>&1)
-    rc=$?
-    _expect_failure ${rc}
+    output=$(${CLEANUP} 2>&1)
+    RC=$?
+    _expect_failure
     needle="CLEANUP_MOUNTPOINT:"  # Shell syntax varies when reporting missing
     _find_in_output
 }
