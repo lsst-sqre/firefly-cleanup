@@ -1,4 +1,11 @@
 
+<a id='changelog-0.2.0'></a>
+## 0.2.0 (2026-10-21)
+
+### Other changes
+
+- Moved from Alpine to debian:trixie-slim.
+
 <a id='changelog-0.1.0'></a>
 ## 0.1.0 (2026-10-20)
 

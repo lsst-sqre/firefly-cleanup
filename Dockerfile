@@ -1,8 +1,17 @@
-FROM alpine:latest
+FROM debian:trixie-slim
 
-RUN apk add quota-tools grep
-COPY cleanup /cleanup
-RUN chmod 0755 /cleanup
-# Uncomment these if you want to do in-container testing.
-# COPY test_cleanup test.env /
-# RUN chmod 0755 /test_cleanup
+RUN apt-get update
+COPY scripts/install-base-packages.sh .
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    ./install-base-packages.sh && rm install-base-packages.sh
+
+RUN mkdir -p /app/test
+COPY app/cleanup /app/cleanup
+COPY app/cleanup-fns.sh /app/cleanup-fns.sh
+RUN chmod 0755 /app/cleanup
+
+COPY app/test/test_cleanup /app/test/test_cleanup
+COPY app/test/test.env /app/test/test.env
+RUN chmod 0755 /app/test/test_cleanup
