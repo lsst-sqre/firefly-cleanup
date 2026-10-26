@@ -23,6 +23,71 @@ _expect_failure() {
     fi
 }
 
+_expect_rc () {
+    # ${RC} and ${WANT_RC} are set externally
+    if [ "${RC}" -ne "${WANT_RC}" ]; then
+        printf "Expected rc=%s, got %s\n" "${WANT_RC}" "${RC}" 1>&2
+        exit 1
+    fi
+}
+
+_expect_exists () {
+    # ${VICTIM} is set externally
+    if ! [ -e "${VICTIM}" ]; then
+        printf "Expected \"%s\" to survive, but it was removed\n" \
+               "${VICTIM}" 1>&2
+        exit 1
+    fi
+}
+
+_expect_gone () {
+    # ${VICTIM} is set externally
+    if [ -e "${VICTIM}" ]; then
+        printf "Expected \"%s\" to be removed, but it survived\n" \
+               "${VICTIM}" 1>&2
+        exit 1
+    fi
+}
+
+# The tests below drive the real find/rm pipeline, which _TESTING=1 skips.
+# They need a mock 'quota' on PATH; ${MOCKBIN} holds it and ${SANDBOX} is
+#  the throwaway tree being cleaned.  Nothing outside ${SANDBOX} is touched.
+_mock_quota () {
+    # ${QUOTA_OUT} is the text the mock prints.
+    mkdir -p "${MOCKBIN}"
+    printf '#!/bin/sh\nprintf "%%s\\\\n" "%s"\n' "${QUOTA_OUT}" \
+           > "${MOCKBIN}/quota"
+    chmod 0755 "${MOCKBIN}/quota"
+}
+
+# A 'quota' reporting 95%% blocks used and 3%% inodes, in the wrapped layout
+#  real GNU quota emits when the filesystem name is long.  Over threshold, so
+#  cleanup will try to delete.
+QUOTA_OVER='srv.example.com:/export/firefly\n 9500 10000 10000 300 10000 10000'
+
+_setup_sandbox () {
+    SANDBOX=$(mktemp -d)
+    MOCKBIN=$(mktemp -d)
+    export SANDBOX MOCKBIN
+}
+
+_teardown_sandbox () {
+    rm -rf "${SANDBOX}" "${MOCKBIN}"
+}
+
+_run_real_cleanup () {
+    # Runs cleanup for real (no _TESTING) against ${SANDBOX}.
+    OUTPUT=$(_TESTING="" CLEANUP_MOUNTPOINT="${SANDBOX}" \
+             CLEANUP_THRESHOLD=80 PATH="${MOCKBIN}:${PATH}" \
+             ${CLEANUP} 2>&1)
+    RC=$?
+}
+
+# These tests assert on cleanup's own output, so an inherited $DEBUG would
+#  mix 'set -x' tracing into what we capture and every needle would miss.
+#  Drop it rather than leaving the suite dependent on a clean environment.
+unset DEBUG
+
 _TESTING=1
 CLEANUP_MOUNTPOINT=/tmp
 CLEANUP_THRESHOLD=80
@@ -33,9 +98,9 @@ export _TESTING CLEANUP_MOUNTPOINT CLEANUP_THRESHOLD
 
 test_output_text () {
     OUTPUT=$(${CLEANUP} 2>&1)
-    for NEEDLE in "find /tmp -print0 -type f -mtime +7" \
-                      "find /tmp -print0 -type f -mmin +30" \
-                      "grep -v -z --null ^/tmp" \
+    for NEEDLE in "find \"/tmp\" -type f -mtime +7 -print0" \
+                      "find \"/tmp\" -type f -mmin +30 -print0" \
+                      "grep -v -z -F -x \"/tmp\"" \
                       "xargs -0 -r rm -f" \
                       "7d block usage at 95% > 80%" \
                       "15m file usage at 95% > 80%" \
@@ -48,26 +113,26 @@ test_output_text () {
 test_threshold () {
     CLEANUP_THRESHOLD="bob"
     export CLEANUP_THRESHOLD
-    output=$(${CLEANUP} 2>&1)
+    OUTPUT=$(${CLEANUP} 2>&1)
     RC=$?
     _expect_failure
-    needle="Threshold ${CLEANUP_THRESHOLD} not between 1% and 99%!"
+    NEEDLE="Threshold ${CLEANUP_THRESHOLD} not between 1% and 99%!"
     _find_in_output
     
     CLEANUP_THRESHOLD="-3"
     export CLEANUP_THRESHOLD
-    output=$(${CLEANUP} 2>&1)
+    OUTPUT=$(${CLEANUP} 2>&1)
     RC=$?
     _expect_failure
-    needle="Threshold ${CLEANUP_THRESHOLD} not between 1% and 99%!"
+    NEEDLE="Threshold ${CLEANUP_THRESHOLD} not between 1% and 99%!"
     _find_in_output
 
     CLEANUP_THRESHOLD="110"
     export CLEANUP_THRESHOLD
-    output=$(${CLEANUP} 2>&1)
+    OUTPUT=$(${CLEANUP} 2>&1)
     RC=$?
     _expect_failure
-    needle="Threshold ${CLEANUP_THRESHOLD} not between 1% and 99%!"
+    NEEDLE="Threshold ${CLEANUP_THRESHOLD} not between 1% and 99%!"
     _find_in_output
 
     CLEANUP_THRESHOLD="80"
@@ -75,14 +140,207 @@ test_threshold () {
 }
 
 test_mountpoint () {
+    # A missing mountpoint is a setup error, which the README documents as
+    #  rc=1.  It used to fall through to 'set -u' inside the loop and exit 2
+    #  (the "failed to clean" code) after already invoking quota with an
+    #  empty path, so alerting could not tell misconfiguration from a full
+    #  filesystem.
     unset CLEANUP_MOUNTPOINT
-    output=$(${CLEANUP} 2>&1)
+    OUTPUT=$(${CLEANUP} 2>&1)
     RC=$?
     _expect_failure
-    needle="CLEANUP_MOUNTPOINT:"  # Shell syntax varies when reporting missing
+    WANT_RC=1
+    _expect_rc
+    NEEDLE="CLEANUP_MOUNTPOINT"
     _find_in_output
+    CLEANUP_MOUNTPOINT=/tmp
+    export CLEANUP_MOUNTPOINT
+}
+
+test_mountpoint_must_be_a_directory () {
+    # A mountpoint that isn't there at all is also a setup error, and the
+    #  most likely misconfiguration in practice.
+    CLEANUP_MOUNTPOINT=/nonexistent/path/for/testing
+    export CLEANUP_MOUNTPOINT
+    OUTPUT=$(${CLEANUP} 2>&1)
+    RC=$?
+    _expect_failure
+    WANT_RC=1
+    _expect_rc
+    NEEDLE="/nonexistent/path/for/testing"
+    _find_in_output
+    CLEANUP_MOUNTPOINT=/tmp
+    export CLEANUP_MOUNTPOINT
+}
+
+test_age_filter_is_applied () {
+    # The age ladder must spare files younger than its current rung.
+    # Regression: '-print0' placed before the filters made find emit every
+    #  path regardless of age, so brand-new files were deleted on the first
+    #  (14-day) rung.
+    _setup_sandbox
+    QUOTA_OUT="${QUOTA_OVER}"
+    _mock_quota
+    touch "${SANDBOX}/brand_new"
+    _run_real_cleanup
+    VICTIM="${SANDBOX}/brand_new"
+    _expect_exists
+    _teardown_sandbox
+}
+
+test_old_files_are_removed () {
+    # The converse of the above: genuinely old files must still go.
+    _setup_sandbox
+    QUOTA_OUT="${QUOTA_OVER}"
+    _mock_quota
+    touch "${SANDBOX}/ancient"
+    # 20 days old: older than the 14d first rung.
+    touch -d "20 days ago" "${SANDBOX}/ancient" 2>/dev/null \
+        || touch -t "$(date -v-20d +%Y%m%d%H%M 2>/dev/null)" \
+                 "${SANDBOX}/ancient"
+    _run_real_cleanup
+    VICTIM="${SANDBOX}/ancient"
+    _expect_gone
+    _teardown_sandbox
+}
+
+test_mountpoint_itself_survives () {
+    # The mountpoint must never be removed, even when empty.
+    _setup_sandbox
+    QUOTA_OUT="${QUOTA_OVER}"
+    _mock_quota
+    _run_real_cleanup
+    VICTIM="${SANDBOX}"
+    _expect_exists
+    _teardown_sandbox
+}
+
+test_unreadable_subdir_does_not_abort () {
+    # 'find' exits nonzero if any subdirectory is unreadable, which is
+    #  routine in a shared workarea.  With pipefail that status used to
+    #  abort the whole run, skipping the remaining rungs of the age ladder
+    #  and the final report.  One bad directory must not stop cleanup.
+    #
+    # Skipped when running as root, which can read everything regardless
+    #  of mode.
+    if [ "$(id -u)" -eq 0 ]; then
+        return
+    fi
+    _setup_sandbox
+    QUOTA_OUT="${QUOTA_OVER}"
+    _mock_quota
+    mkdir -p "${SANDBOX}/readable" "${SANDBOX}/locked"
+    touch -d "20 days ago" "${SANDBOX}/readable/old" 2>/dev/null \
+        || touch "${SANDBOX}/readable/old"
+    chmod 000 "${SANDBOX}/locked"
+    _run_real_cleanup
+    chmod 755 "${SANDBOX}/locked"  # So teardown can remove it.
+    # It cannot get under threshold (the mock is fixed at 95%), so the
+    #  expected outcome is the honest "failed to clean" report, not an
+    #  abort partway through the ladder.
+    WANT_RC=2
+    _expect_rc
+    NEEDLE="Failed to clean"
+    _find_in_output
+    _teardown_sandbox
+}
+
+test_mountpoint_with_metacharacters_survives () {
+    # The mountpoint used to be interpolated into a regex unescaped.  In a
+    #  basic regular expression '+' and '(' are literals, but '*' and '['
+    #  are not: '*' stopped the exclusion from matching, so an empty
+    #  mountpoint reached 'rmdir' and was removed, and '[' made grep fail
+    #  with "Unmatched [".  A '.' over-matched, wrongly sparing siblings.
+    _setup_sandbox
+    QUOTA_OUT="${QUOTA_OVER}"
+    _mock_quota
+    for suffix in 'a*b' 'a[b' 'a.b' 'a+b'; do
+        victim="${SANDBOX}/${suffix}"
+        mkdir -p "${victim}"
+        OUTPUT=$(_TESTING="" CLEANUP_MOUNTPOINT="${victim}" \
+                 CLEANUP_THRESHOLD=80 PATH="${MOCKBIN}:${PATH}" \
+                 ${CLEANUP} 2>&1)
+        VICTIM="${victim}"
+        _expect_exists
+    done
+    _teardown_sandbox
+}
+
+test_mountpoint_with_space_is_cleaned () {
+    # The commands were built as strings and re-split on execution, so a
+    #  mountpoint containing a space became two arguments and nothing was
+    #  cleaned at all.
+    _setup_sandbox
+    QUOTA_OUT="${QUOTA_OVER}"
+    _mock_quota
+    victim="${SANDBOX}/a dir with spaces"
+    mkdir -p "${victim}"
+    touch -d "20 days ago" "${victim}/ancient" 2>/dev/null \
+        || touch "${victim}/ancient"
+    OUTPUT=$(_TESTING="" CLEANUP_MOUNTPOINT="${victim}" \
+             CLEANUP_THRESHOLD=80 PATH="${MOCKBIN}:${PATH}" \
+             ${CLEANUP} 2>&1)
+    VICTIM="${victim}/ancient"
+    _expect_gone
+    VICTIM="${victim}"
+    _expect_exists   # ...but not the mountpoint itself
+    _teardown_sandbox
+}
+
+test_quota_failure_is_not_success () {
+    # If 'quota' cannot report usage we have no idea whether we are over
+    #  threshold, so exiting 0 would be a silent no-op that alerting reads
+    #  as success.  Must fail loudly instead.
+    _setup_sandbox
+    mkdir -p "${MOCKBIN}"
+    printf '#!/bin/sh\nexit 1\n' > "${MOCKBIN}/quota"
+    chmod 0755 "${MOCKBIN}/quota"
+    _run_real_cleanup
+    WANT_RC=1
+    _expect_rc
+    _teardown_sandbox
+}
+
+test_zero_quota_limit_is_unlimited () {
+    # A filesystem with no inode limit reports a limit of 0.  Dividing by it
+    #  yielded '+inf', which broke the "[ +inf -lt 80 ]" comparison.  A zero
+    #  limit means unlimited, so inode usage should read 0% and only the
+    #  block figure should drive the decision.  Here blocks really are over
+    #  threshold and there is nothing to delete, so we expect rc=2 (failed
+    #  to clean) -- not a crash, and not a false success.
+    _setup_sandbox
+    QUOTA_OUT='srv.example.com:/export/firefly 9500 10000 10000 300 0 0'
+    _mock_quota
+    _run_real_cleanup
+    WANT_RC=2
+    _expect_rc
+    NEEDLE="final file usage: 0%"
+    _find_in_output
+    _teardown_sandbox
+}
+
+test_unparsable_quota_is_not_success () {
+    # Garbage where the numbers should be must not be read as "under
+    #  threshold".
+    _setup_sandbox
+    QUOTA_OUT='srv.example.com:/export/firefly no idea at all'
+    _mock_quota
+    _run_real_cleanup
+    WANT_RC=1
+    _expect_rc
+    _teardown_sandbox
 }
 
 test_output_text
 test_threshold
 test_mountpoint
+test_mountpoint_must_be_a_directory
+test_age_filter_is_applied
+test_old_files_are_removed
+test_mountpoint_itself_survives
+test_unreadable_subdir_does_not_abort
+test_mountpoint_with_metacharacters_survives
+test_mountpoint_with_space_is_cleaned
+test_quota_failure_is_not_success
+test_zero_quota_limit_is_unlimited
+test_unparsable_quota_is_not_success

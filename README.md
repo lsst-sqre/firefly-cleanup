@@ -41,10 +41,16 @@ Both rely on files in `app/test`.
 
 ## Required commands
 
-The `cleanup` command depends on the following additional commands: `awk`, `command`, and `cut`.
+The `cleanup` command depends on the following additional commands: `awk`, `command`, `dirname`, and `tail`.
 For it to run in non-testing mode, the following additional commands are required: `find`, `grep`, `quota`, and `xargs`.
 It also relies on `quota` correctly functioning for it to run and remove files, which is likely to involve having NFS utilities installed as well.
 When testing, `quota` is mocked out, and the test mode does not use `find`, `grep`, or `xargs`.
+
+`readlink` is used if present, so that the script can be installed via a symlink, but it is not required.
+All of the required commands are POSIX Mandatory except `quota`.
+
+`cleanup` invokes `quota` with `-w` (`--no-wrap`).
+Without it, `quota` moves a long filesystem name onto its own line and omits it from the line carrying the values, which shifts the fields it parses.
 
 ## Output
 
@@ -54,6 +60,9 @@ Any output is on `stderr` and indicates an error has occurred.
 ## Return codes
 
 This script exits with return code 0 on success; both "we were not above quota so we did nothing" and removing files until under quota are successes.
-It exits with return code 1 for incorrect setup (missing required variables or missing required commands), and with return code 2 for failure to clean the requested directory.
+It exits with return code 1 for incorrect setup, and with return code 2 for failure to clean the requested directory.
+
+Return code 1 covers a missing or non-numeric `$CLEANUP_THRESHOLD`, a missing `$CLEANUP_MOUNTPOINT` or one that is not a directory, a missing required command, and any failure to read the quota.
+That last case matters: if `quota` fails or returns something unparsable, the script cannot tell whether it is over threshold, so it fails rather than exiting 0 — a silent "success" that cleaned nothing would let the filesystem fill up unnoticed.
 
 When testing, it exits with return code 0 if all the tests pass, and with return code 1 if any fail.
